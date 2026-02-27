@@ -94,7 +94,8 @@ async def orchestrate(
 
     try:
         decomp: dict[str, Any] = await call_gemma_json(decomp_prompt)
-    except GemmaError:
+    except GemmaError as exc:
+        logger.exception("Step 2 (decomposition) Gemma call failed: %s", exc)
         yield f'{{"event": "result", "data": {_FALLBACK_PAYLOAD.model_dump_json()}}}\n\n'
         return
 
@@ -171,7 +172,8 @@ async def orchestrate(
 
     try:
         scores_list: list[dict[str, Any]] = await call_gemma_json(eval_prompt)
-    except GemmaError:
+    except GemmaError as exc:
+        logger.warning("Step 4 (evaluation) Gemma call failed — proceeding without scores: %s", exc)
         scores_list = []
 
     # Map scores back to candidates

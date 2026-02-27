@@ -13,7 +13,8 @@ class Settings(BaseSettings):
 
     # Google AI
     google_api_key: str = Field(..., env="GOOGLE_API_KEY")
-    gemma_model: str = Field("gemma-2-9b-it", env="GEMMA_MODEL")
+    gemma_model: str = Field("gemini-2.5-flash", env="GEMMA_MODEL")
+    gemma_fallback_model: str = Field("gemma-3-12b-it", env="GEMMA_FALLBACK_MODEL")
     embedding_model: str = Field("gemini-embedding-001", env="EMBEDDING_MODEL")
     embedding_dimensions: int = Field(768, env="EMBEDDING_DIMENSIONS")
 

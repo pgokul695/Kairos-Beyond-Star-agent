@@ -5,6 +5,7 @@ and updates the user profile. Never touches allergy data.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -106,6 +107,13 @@ async def update_user_profile(
         )
         await db.commit()
         logger.debug("Profiler updated user %s with keys: %s", uid, list(extracted.keys()))
+
+        # Pre-warm recommendations in the background after a successful profile update
+        try:
+            from app.services.recommendation_service import prewarm_recommendations  # noqa: PLC0415
+            asyncio.create_task(prewarm_recommendations(uid, db))
+        except Exception as prewarm_exc:  # noqa: BLE001
+            logger.debug("Prewarm task creation failed for user %s: %s", uid, prewarm_exc)
 
     except Exception as exc:
         logger.error("Profiler failed for user %s: %s", uid, exc)

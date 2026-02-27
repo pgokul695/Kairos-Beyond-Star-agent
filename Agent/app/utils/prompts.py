@@ -226,3 +226,160 @@ def build_allergy_context(allergies: dict[str, Any]) -> str:
         )
 
     return "\n".join(parts)
+
+
+# ── Recommendation fit explanation ────────────────────────────────────────────
+
+
+def build_fit_explanation_prompt(
+    restaurants: list[dict[str, Any]],
+    user_profile: dict[str, Any],
+) -> str:
+    """
+    Build the batch prompt for generating consolidated_review strings.
+
+    Sends all selected restaurants in a single LLM call.
+    Returns a JSON array — one object per restaurant, keyed by restaurant_id.
+    """
+    restaurants_json = json.dumps(restaurants, ensure_ascii=False, indent=2)
+
+    # Build a readable user context for the prompt
+    dietary = user_profile.get("dietary_flags", [])
+    vibes   = user_profile.get("vibe_tags", [])
+    cuisine = user_profile.get("cuisine_affinity", [])
+    price   = user_profile.get("preferred_price_tiers", [])
+
+    user_ctx_parts: list[str] = []
+    if dietary:
+        user_ctx_parts.append(f"Dietary: {', '.join(dietary)}")
+    if vibes:
+        user_ctx_parts.append(f"Vibes: {', '.join(vibes)}")
+    if cuisine:
+        user_ctx_parts.append(f"Cuisine affinity: {', '.join(cuisine)}")
+    if price:
+        user_ctx_parts.append(f"Price comfort: {', '.join(price)}")
+    user_ctx = "\n".join(user_ctx_parts) if user_ctx_parts else "No preferences set."
+
+    return f"""You are Kairos, a restaurant intelligence AI for Bangalore.
+Your task is to write a concise consolidated_review for each restaurant below,
+personalised to the user's preferences.
+
+## USER PROFILE
+{user_ctx}
+
+## RESTAURANTS
+{restaurants_json}
+
+## TASK
+For each restaurant, produce:
+  - "restaurant_id": the integer id of the restaurant
+  - "consolidated_review": a single sentence ≤ 160 characters.
+    Requirements:
+      - Must include ONE specific concrete detail: a dish name, a defining
+        characteristic, or a direct quote-style insight from reviewer sentiment.
+      - Written in present tense.
+      - NEVER generic ("great food and ambiance"). Always specific.
+      - Do NOT mention any allergen that is in the user's dietary restrictions.
+        AllergyGuard handles that separately; do not duplicate allergy language here.
+  - "fit_tags_override": null  (always null — use the algorithmic tags)
+
+## SAFETY
+Never mention the user's allergens or intolerances in the consolidated_review.
+AllergyGuard annotates allergen warnings separately. Your job is only the review copy.
+
+## OUTPUT FORMAT
+Output only a valid JSON array. No markdown fences. No preamble. No explanation.
+One element per restaurant, in the same order as the input list.
+
+Example:
+[
+  {{
+    "restaurant_id": 42,
+    "consolidated_review": "Famous for their ghee-roast dosa served on a banana leaf — the crispy edges alone are worth the trip.",
+    "fit_tags_override": null
+  }}
+]"""
+
+
+# ── Recommendation expand detail ──────────────────────────────────────────────
+
+
+def build_expand_detail_prompt(
+    restaurant: dict[str, Any],
+    reviews: list[str],
+    user_profile: dict[str, Any],
+) -> str:
+    """
+    Build the prompt for generating a fully structured ExpandedDetail payload.
+
+    Uses a single restaurant + its reviews + the user profile.
+    Returns JSON matching the ExpandedDetail schema exactly.
+    """
+    restaurant_json = json.dumps(restaurant, ensure_ascii=False, indent=2)
+    reviews_json    = json.dumps(reviews[:10], ensure_ascii=False, indent=2)
+
+    dietary = user_profile.get("dietary_flags", [])
+    vibes   = user_profile.get("vibe_tags", [])
+    cuisine = user_profile.get("cuisine_affinity", [])
+    price   = user_profile.get("preferred_price_tiers", [])
+
+    user_ctx_parts: list[str] = []
+    if dietary:
+        user_ctx_parts.append(f"Dietary preferences: {', '.join(dietary)}")
+    if vibes:
+        user_ctx_parts.append(f"Vibe preferences: {', '.join(vibes)}")
+    if cuisine:
+        user_ctx_parts.append(f"Cuisine affinity: {', '.join(cuisine)}")
+    if price:
+        user_ctx_parts.append(f"Price comfort: {', '.join(price)}")
+    user_ctx = "\n".join(user_ctx_parts) if user_ctx_parts else "No preferences set."
+
+    return f"""You are Kairos, a restaurant intelligence AI for Bangalore.
+Analyse the restaurant and its reviews below, then generate a richly structured
+ExpandedDetail payload that explains why this restaurant fits the user.
+
+## USER PROFILE
+{user_ctx}
+
+## RESTAURANT
+{restaurant_json}
+
+## REVIEWS (up to 10, most recent first)
+{reviews_json}
+
+## OUTPUT SCHEMA
+Return ONLY a JSON object with EXACTLY these fields:
+
+{{
+  "review_summary": "A full paragraph summarising all reviews — tone, highlights, recurring praise, recurring complaints. 3–5 sentences.",
+  "highlights": [
+    {{"emoji": "<single relevant emoji>", "text": "<concise highlight text>"}},
+    ...   // 3–5 items total
+  ],
+  "crowd_profile": "Describe the actual customer type inferred from review signals — e.g. regulars, demographics, occasion types. Not generic language.",
+  "best_for": ["<occasion tag>", ...],   // 2–4 items grounded in review content
+  "avoid_if": ["<situation>", ...],      // 1–3 items grounded in review content
+  "radar_scores": {{
+    "romance": <float 0–10>,
+    "noise_level": <float 0–10>,
+    "food_quality": <float 0–10>,
+    "vegan_options": <float 0–10>,
+    "value_for_money": <float 0–10>
+  }},
+  "why_fit_paragraph": "Reference the user's specific stored preferences by name e.g. 'your vegan diet', 'your preference for quiet vibes'. Explain concretely how this restaurant satisfies them. 2–3 sentences.",
+  "allergy_detail": {{
+    "is_safe": <bool>,
+    "confidence": "high" | "medium" | "low",
+    "warnings": [],
+    "safe_note": "<optional short sentence — present only when is_safe is true>"
+  }}
+}}
+
+## RULES
+- highlights: each must start with a single relevant emoji (the emoji goes in the "emoji" field, not the "text" field)
+- crowd_profile: infer from actual review language — never invent
+- why_fit_paragraph: must explicitly reference the user's named preferences listed above
+- best_for / avoid_if: must be grounded in actual review signals, not invented
+- radar_scores: infer from review sentiment; use 5.0 as neutral when signal is insufficient
+- allergy_detail.warnings: leave as empty array — AllergyGuard handles this separately
+- Output only valid JSON. No markdown fences. No preamble. No trailing text."""
