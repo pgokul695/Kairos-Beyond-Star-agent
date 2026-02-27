@@ -111,7 +111,7 @@ async def update_user_profile(
         # Pre-warm recommendations in the background after a successful profile update
         try:
             from app.services.recommendation_service import prewarm_recommendations  # noqa: PLC0415
-            asyncio.create_task(prewarm_recommendations(uid, db))
+            asyncio.create_task(prewarm_recommendations(uid))
         except Exception as prewarm_exc:  # noqa: BLE001
             logger.debug("Prewarm task creation failed for user %s: %s", uid, prewarm_exc)
 

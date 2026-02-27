@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from app.config import settings
 from app.database import AsyncSessionLocal, engine, init_pgvector
 from app.models import Base
-from app.routers import chat, health, users, recommendations
+from app.routers import chat, health, users, recommendations, auth
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -79,6 +79,7 @@ app.add_middleware(
 # ── Routers ──────────────────────────────────────────────────────────────────
 
 app.include_router(health.router)
+app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(users.router)
 app.include_router(recommendations.router)

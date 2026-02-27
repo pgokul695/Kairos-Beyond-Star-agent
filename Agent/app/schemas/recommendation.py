@@ -83,9 +83,10 @@ class RecommendationItem(BaseModel):
 
     rank: int
     restaurant: RestaurantResult
-    fit_score: int                            # 0–100 algorithmic score
+    fit_score: int                            # 0–100 agentic/algorithmic score
     fit_tags: list[FitTag]                    # up to 4 dimensional tags
     consolidated_review: str                  # ≤160 chars, LLM-generated
+    why_fit_paragraph: str = ""              # 2–3 sentence personalised fit rationale
     allergy_summary: AllergySummary
     expanded_detail: Optional[ExpandedDetail] = None   # null until /expand called
 
@@ -94,5 +95,5 @@ class RecommendationPayload(BaseModel):
     """Top-level response envelope for GET /recommendations/{uid}."""
 
     uid: str
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
     recommendations: list[RecommendationItem]

@@ -383,3 +383,131 @@ Return ONLY a JSON object with EXACTLY these fields:
 - radar_scores: infer from review sentiment; use 5.0 as neutral when signal is insufficient
 - allergy_detail.warnings: leave as empty array — AllergyGuard handles this separately
 - Output only valid JSON. No markdown fences. No preamble. No trailing text."""
+
+
+# ── Agentic scorer (v2) ───────────────────────────────────────────────────────
+
+
+def build_agentic_scorer_prompt(
+    candidates: list[Any],
+    user_profile: dict[str, Any],
+    review_snippets: dict[int, list[str]],
+) -> str:
+    """
+    Build the batched prompt for the AgenticScorer — Stage 2 of the v2 pipeline.
+
+    Called once per recommendation request with up to 15 candidate restaurants.
+    The LLM returns a JSON array: one scored item per restaurant.
+
+    Args:
+        candidates:      List of RestaurantResult objects (or dicts) from Stage 1.
+        user_profile:    Merged user preference dict (cuisine_affinity, vibe_tags, etc.).
+        review_snippets: Dict mapping restaurant_id → list[str] (≤3 review texts each).
+
+    Returns:
+        A fully-formed prompt string ready for ``call_gemma_json()``.
+    """
+    # Build user context section
+    dietary = user_profile.get("dietary_flags", [])
+    vibes   = user_profile.get("vibe_tags", [])
+    cuisine = user_profile.get("cuisine_affinity", [])
+    price   = user_profile.get("preferred_price_tiers", [])
+    aversions = user_profile.get("cuisine_aversions", [])
+
+    ctx_parts: list[str] = []
+    if cuisine:
+        ctx_parts.append(f"Cuisine affinity: {', '.join(cuisine)}")
+    if aversions:
+        ctx_parts.append(f"Cuisine aversions (never mention positively): {', '.join(aversions)}")
+    if vibes:
+        ctx_parts.append(f"Vibe preferences: {', '.join(vibes)}")
+    if price:
+        ctx_parts.append(f"Price comfort: {', '.join(price)}")
+    if dietary:
+        ctx_parts.append(f"Dietary flags: {', '.join(dietary)}")
+    user_ctx = "\n".join(ctx_parts) if ctx_parts else "No preferences set."
+
+    # Build restaurant list with embedded review snippets
+    restaurants_with_reviews: list[dict[str, Any]] = []
+    for r in candidates:
+        # Handle both object attributes and dict access
+        def _get(attr: str, default: Any = None) -> Any:
+            if hasattr(r, attr):
+                return getattr(r, attr, default)
+            if isinstance(r, dict):
+                return r.get(attr, default)
+            return default
+
+        rid      = _get("id")
+        snippets = review_snippets.get(int(rid), []) if rid is not None else []
+
+        restaurants_with_reviews.append({
+            "restaurant_id":   rid,
+            "name":            _get("name", ""),
+            "cuisine_type":    _get("cuisine_type", ""),
+            "vibe_tags":       _get("vibe_tags", []),
+            "price_tier":      _get("price_tier", ""),
+            "average_rating":  _get("average_rating"),
+            "area":            _get("area", ""),
+            "dietary_options": _get("dietary_options", []),
+            "review_snippets": snippets,
+        })
+
+    restaurants_json = json.dumps(restaurants_with_reviews, ensure_ascii=False, indent=2)
+
+    return f"""You are Kairos, a restaurant intelligence AI for Bangalore.
+Your task is to score and annotate a set of candidate restaurants for a specific user.
+This is Stage 2 of a two-stage recommendation pipeline. Use the user's profile and
+the provided review snippets to produce rich, personalised output for each restaurant.
+
+## USER PROFILE
+{user_ctx}
+
+## CANDIDATE RESTAURANTS (with review snippets)
+{restaurants_json}
+
+## TASK
+For each restaurant in the list, produce one JSON object containing:
+
+  - "restaurant_id": integer — the id of the restaurant (preserve exactly)
+  - "fit_score": integer 0–100 — your personalised fit score for this user.
+      Consider ALL profile dimensions: cuisine, vibe, price, dietary, allergen safety.
+      Base it on the review snippets and profile alignment, not just metadata.
+  - "fit_tags": array of objects, each with "label" (string) and "type" (one of:
+      "cuisine", "vibe", "price", "dietary", "allergy_safe").
+      Include 2–4 tags. Only include "allergy_safe" tag if reviews/metadata
+      strongly signal the restaurant accommodates the user's dietary needs.
+      Each label must be specific and concrete (e.g. "Great for vegans", not "Good food").
+  - "consolidated_review": single sentence ≤ 160 characters.
+      Must include ONE specific concrete detail from the review snippets
+      (a dish name, characteristic, or quote-style insight).
+      Present tense. NEVER generic. Do NOT mention allergens from user's dietary flags.
+      Leave as empty string "" if no review snippets are available.
+  - "why_fit_paragraph": 2–3 sentences explaining why THIS restaurant fits THIS user.
+      Explicitly reference the user's named preferences (e.g. "your vibe for quiet rooftops",
+      "your north Indian affinity"). Grounded in review signals, not invented.
+
+## SAFETY RULES
+- Never mention the user's allergens in consolidated_review or why_fit_paragraph.
+  AllergyGuard annotates allergen warnings separately.
+- Never mark a restaurant "allergy_safe" unless review snippets or dietary_options
+  strongly support it.
+- If cuisine_aversions are set, do NOT produce positive framing around those cuisines.
+
+## OUTPUT FORMAT
+Output ONLY a valid JSON array — one element per restaurant, same order as input.
+No markdown fences. No preamble. No explanation. No trailing text.
+
+Example element:
+{{
+  "restaurant_id": 42,
+  "fit_score": 87,
+  "fit_tags": [
+    {{"label": "North Indian specialist", "type": "cuisine"}},
+    {{"label": "Quiet rooftop vibe", "type": "vibe"}},
+    {{"label": "Vegan-friendly menu", "type": "dietary"}}
+  ],
+  "consolidated_review": "Famous for their ghee-roast dosa — crispy edges and banana leaf service are the draw.",
+  "why_fit_paragraph": "Given your preference for north Indian cuisine and calm rooftop vibes, this place ticks both boxes. Reviews consistently mention the ghost-kitchen-style focus on quality over ambiance, which aligns with your value-for-money tier."
+}}"""
+

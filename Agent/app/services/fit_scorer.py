@@ -1,267 +1,314 @@
 """
-FitScorer — pure algorithmic restaurant–user fit scoring.
+Algorithmic pre-filter for the v2 recommendation pipeline.
 
-Zero LLM calls. Zero DB calls. Takes pre-fetched data; returns a score and
-tag list. Designed to run on up to 50 candidates per request without I/O.
+Stage 1 of a two-stage scoring system:
+  AlgorithmicPreFilter  — pure Python, 50 → 15, zero LLM calls.
+  AgenticScorer         — one batched LLM call on the 15 survivors (in recommendation_service).
+
+Scoring dimensions (max 100 pts):
+  cuisine_affinity   30 pts
+  vibe_match         25 pts
+  price_comfort      20 pts
+  dietary_fit        15 pts
+  rating_baseline    10 pts   (replaces allergy_safety from v1)
+
+Hard-drop rule:
+  If any item in the restaurant's cuisine_type matches the user's
+  cuisine_aversions the restaurant is excluded entirely (score = -1,
+  never appears in output).
+
+Usage::
+    snapshot = UserProfileSnapshot.from_dict(user_profile_dict)
+    pre_filter = AlgorithmicPreFilter()
+    scored = pre_filter.score_all(candidates, snapshot, top_k=15)
+    # scored: list[tuple[RestaurantResult, int]] sorted desc by score
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Literal
 
 from app.schemas.restaurant import RestaurantResult
 
 logger = logging.getLogger(__name__)
 
-# Price tier ordering for adjacency calculation
-_PRICE_TIER_ORDER: list[str] = ["$", "$$", "$$$", "$$$$"]
+# ── Normalisation helpers ──────────────────────────────────────────────────────
+
+_PRICE_TIER_ORDER: dict[str, int] = {
+    "budget":      0,
+    "affordable":  1,
+    "mid-range":   2,
+    "upscale":     3,
+    "fine-dining": 4,
+}
 
 
-# ── Data classes ──────────────────────────────────────────────────────────────
+def _norm(text: str) -> str:
+    """Lowercase + strip for fuzzy-matching tags."""
+    return text.lower().strip()
 
 
-@dataclass
-class FitTag:
-    """A single human-readable fit dimension tag."""
-
-    label: str
-    type: Literal["cuisine", "vibe", "price", "dietary", "allergy_safe"]
+def _norm_set(items: list[str]) -> set[str]:
+    return {_norm(i) for i in items if i}
 
 
-@dataclass
-class FitResult:
-    """Result of FitScorer.score() for one restaurant."""
-
-    score: int               # 0–100
-    fit_tags: list[FitTag] = field(default_factory=list)
+def _r_cuisine(r: RestaurantResult) -> str:
+    """Return a single normalised cuisine string for matching."""
+    # cuisine_types is the canonical list; join for substring matching
+    return _norm(" ".join(r.cuisine_types or []))
 
 
-# ── Scorer ────────────────────────────────────────────────────────────────────
+def _r_vibes(r: RestaurantResult) -> list[str]:
+    """Vibe tags live in the meta JSONB column."""
+    return (r.meta or {}).get("vibe_tags", []) or []
 
 
-class FitScorer:
+def _r_dietary(r: RestaurantResult) -> list[str]:
+    """Dietary options live in the meta JSONB column."""
+    return (r.meta or {}).get("dietary_options", []) or []
+
+
+# ── UserProfileSnapshot ────────────────────────────────────────────────────────
+
+
+@dataclass(slots=True)
+class UserProfileSnapshot:
     """
-    Scores a restaurant against a user profile on five dimensions.
+    Immutable view of the fields needed for algorithmic scoring.
 
-    Dimension breakdown (total 100 pts):
-      Cuisine affinity   30 pts
-      Vibe match         25 pts
-      Price comfort      20 pts
-      Dietary compat     15 pts
-      Allergy safety     10 pts
+    Created from the raw ``user_profile`` dict stored in the DB so the scorer
+    never touches the DB directly.
     """
 
-    def score(
-        self,
-        restaurant: RestaurantResult,
-        user_profile: dict[str, Any],
-    ) -> FitResult:
-        """
-        Compute fit score and generate up to 4 FitTag labels.
+    cuisine_affinity:      frozenset[str] = field(default_factory=frozenset)
+    cuisine_aversions:     frozenset[str] = field(default_factory=frozenset)
+    vibe_tags:             frozenset[str] = field(default_factory=frozenset)
+    dietary_flags:         frozenset[str] = field(default_factory=frozenset)
+    preferred_price_tiers: frozenset[str] = field(default_factory=frozenset)
 
-        Parameters
-        ----------
-        restaurant:
-            A fully populated RestaurantResult (including allergy_safe /
-            allergy_warnings from a prior AllergyGuard pass).
-        user_profile:
-            Dict with keys: cuisine_affinity, cuisine_aversion, vibe_tags,
-            preferred_price_tiers, dietary_flags, allergy_safe (bool),
-            allergy_warnings (list).
-        """
-        tagged: list[tuple[int, FitTag]] = []
-
-        cuisine_pts, cuisine_tag = self._score_cuisine(restaurant, user_profile)
-        vibe_pts, vibe_tag       = self._score_vibe(restaurant, user_profile)
-        price_pts, price_tag     = self._score_price(restaurant, user_profile)
-        dietary_pts, dietary_tags = self._score_dietary(restaurant, user_profile)
-        allergy_pts, allergy_tag  = self._score_allergy(restaurant)
-
-        total = cuisine_pts + vibe_pts + price_pts + dietary_pts + allergy_pts
-        total = max(0, min(100, total))   # clamp
-
-        # Collect (points, tag) for ranking — we pick highest-scoring dims first
-        if cuisine_tag:
-            tagged.append((cuisine_pts, cuisine_tag))
-        if vibe_tag:
-            tagged.append((vibe_pts, vibe_tag))
-        if price_tag:
-            tagged.append((price_pts, price_tag))
-        for dtag in dietary_tags:
-            tagged.append((dietary_pts, dtag))
-        if allergy_tag:
-            tagged.append((allergy_pts, allergy_tag))
-
-        # Sort descending by points, keep top 4
-        tagged.sort(key=lambda x: x[0], reverse=True)
-        top_tags = [t for _, t in tagged[:4]]
-
-        return FitResult(score=total, fit_tags=top_tags)
-
-    # ── Dimension scorers ─────────────────────────────────────────────────────
-
-    def _score_cuisine(
-        self,
-        restaurant: RestaurantResult,
-        user_profile: dict[str, Any],
-    ) -> tuple[int, FitTag | None]:
-        """
-        +30 full overlap, +15 partial overlap (≥1 of N), -10 aversion hit.
-        Returns (points_awarded, FitTag | None).
-        """
-        affinity: list[str] = [
-            c.lower() for c in user_profile.get("cuisine_affinity", [])
-        ]
-        aversion: list[str] = [
-            c.lower() for c in user_profile.get("cuisine_aversion", [])
-        ]
-        restaurant_cuisines: list[str] = [
-            c.lower() for c in (restaurant.cuisine_types or [])
-        ]
-
-        if not affinity:
-            return 0, None
-
-        overlap = set(affinity) & set(restaurant_cuisines)
-        aversion_hit = set(aversion) & set(restaurant_cuisines)
-
-        if overlap:
-            pts = 30 if len(overlap) >= len(affinity) else 15
-            label = f"Matches your {next(iter(overlap)).title()} preference"
-            tag = FitTag(label=label, type="cuisine")
-            return pts, tag
-
-        if aversion_hit:
-            return -10, None
-
-        return 0, None
-
-    def _score_vibe(
-        self,
-        restaurant: RestaurantResult,
-        user_profile: dict[str, Any],
-    ) -> tuple[int, FitTag | None]:
-        """
-        +5 per overlapping vibe tag, capped at 25.
-        Returns (points_awarded, FitTag | None).
-        """
-        user_vibes: list[str] = [
-            v.lower() for v in user_profile.get("vibe_tags", [])
-        ]
-        restaurant_vibes: list[str] = [
-            v.lower() for v in (restaurant.meta.get("vibes", []) if restaurant.meta else [])
-        ]
-
-        if not user_vibes or not restaurant_vibes:
-            return 0, None
-
-        overlap = [v for v in user_vibes if v in restaurant_vibes]
-        if not overlap:
-            return 0, None
-
-        pts = min(len(overlap) * 5, 25)
-        first_vibe = overlap[0].title()
-        tag = FitTag(
-            label=f"Known for {first_vibe} — your top vibe tag",
-            type="vibe",
+    @classmethod
+    def from_dict(cls, profile: dict) -> "UserProfileSnapshot":
+        """Build a snapshot from the dict stored in users.preferences / columns."""
+        return cls(
+            cuisine_affinity=frozenset(
+                _norm(c) for c in profile.get("cuisine_affinity", []) if c
+            ),
+            cuisine_aversions=frozenset(
+                _norm(c) for c in profile.get("cuisine_aversions", []) if c
+            ),
+            vibe_tags=frozenset(
+                _norm(v) for v in profile.get("vibe_tags", []) if v
+            ),
+            dietary_flags=frozenset(
+                _norm(d) for d in profile.get("dietary_flags", []) if d
+            ),
+            preferred_price_tiers=frozenset(
+                _norm(p) for p in profile.get("preferred_price_tiers", []) if p
+            ),
         )
-        return pts, tag
 
-    def _score_price(
+    @property
+    def is_empty(self) -> bool:
+        """True when user has no stored preference signals at all."""
+        return not any([
+            self.cuisine_affinity,
+            self.vibe_tags,
+            self.dietary_flags,
+            self.preferred_price_tiers,
+        ])
+
+
+# ── AlgorithmicPreFilter ───────────────────────────────────────────────────────
+
+
+class AlgorithmicPreFilter:
+    """
+    Pure-Python, zero-latency pre-filter.
+
+    Scores each candidate on five dimensions and returns the top *top_k*
+    by descending score.  Restaurants that hard-fail the aversion check are
+    excluded before scoring — they never appear in the output.
+
+    An instance is stateless; create one singleton per process.
+    """
+
+    # ── Dimension weights ──────────────────────────────────────────────────────
+
+    CUISINE_W  = 30
+    VIBE_W     = 25
+    PRICE_W    = 20
+    DIETARY_W  = 15
+    RATING_W   = 10
+
+    # ── Cuisine affinity scoring ───────────────────────────────────────────────
+
+    def _cuisine_score(
         self,
         restaurant: RestaurantResult,
-        user_profile: dict[str, Any],
-    ) -> tuple[int, FitTag | None]:
+        snapshot: UserProfileSnapshot,
+    ) -> int:
         """
-        +20 exact match, +10 one tier adjacent, 0 two or more tiers away.
-        Returns (points_awarded, FitTag | None).
+        +30 exact match, +15 partial token overlap, 15 neutral (no preference).
+        Hard-drop tested upstream; aversion restaurants never reach here.
         """
-        preferred: list[str] = user_profile.get("preferred_price_tiers", [])
-        rest_tier: str | None = restaurant.price_tier
+        if not snapshot.cuisine_affinity:
+            return self.CUISINE_W // 2  # neutral: 15
 
-        if not preferred or not rest_tier:
-            return 0, None
+        r_cuisine = _r_cuisine(restaurant)
+        r_tokens  = set(r_cuisine.split())
 
-        if rest_tier in preferred:
-            tag = FitTag(
-                label=f"Within your {rest_tier} comfort zone",
-                type="price",
-            )
-            return 20, tag
+        for affinity in snapshot.cuisine_affinity:
+            if affinity == r_cuisine or affinity in r_cuisine:
+                return self.CUISINE_W
 
-        # Check adjacency using tier order
-        try:
-            rest_idx = _PRICE_TIER_ORDER.index(rest_tier)
-        except ValueError:
-            return 0, None
+        affinity_tokens: set[str] = set()
+        for a in snapshot.cuisine_affinity:
+            affinity_tokens.update(a.split())
 
-        for pref_tier in preferred:
-            try:
-                pref_idx = _PRICE_TIER_ORDER.index(pref_tier)
-                if abs(rest_idx - pref_idx) == 1:
-                    tag = FitTag(
-                        label=f"Within your {pref_tier} comfort zone",
-                        type="price",
-                    )
-                    return 10, tag
-            except ValueError:
+        if r_tokens & affinity_tokens:
+            return self.CUISINE_W // 2  # 15
+
+        return 0
+
+    # ── Vibe match ────────────────────────────────────────────────────────────
+
+    def _vibe_score(
+        self,
+        restaurant: RestaurantResult,
+        snapshot: UserProfileSnapshot,
+    ) -> int:
+        if not snapshot.vibe_tags:
+            return self.VIBE_W // 2  # neutral: 12
+
+        r_vibes = _norm_set(_r_vibes(restaurant))
+        overlap = len(r_vibes & snapshot.vibe_tags)
+
+        if overlap == 0:
+            return 0
+        # 1 overlap → 12, 2 → 20, 3+ → 25
+        return min(self.VIBE_W, 12 + (overlap - 1) * 8)
+
+    # ── Price comfort ─────────────────────────────────────────────────────────
+
+    def _price_score(
+        self,
+        restaurant: RestaurantResult,
+        snapshot: UserProfileSnapshot,
+    ) -> int:
+        if not snapshot.preferred_price_tiers:
+            return self.PRICE_W // 2  # neutral: 10
+
+        r_tier = _norm(restaurant.price_tier or "")
+        if r_tier in snapshot.preferred_price_tiers:
+            return self.PRICE_W
+
+        # Tolerate one tier away
+        r_order = _PRICE_TIER_ORDER.get(r_tier, -1)
+        for pref in snapshot.preferred_price_tiers:
+            p_order = _PRICE_TIER_ORDER.get(pref, -1)
+            if r_order != -1 and p_order != -1 and abs(r_order - p_order) == 1:
+                return self.PRICE_W // 2  # 10
+
+        return 0
+
+    # ── Dietary fit ───────────────────────────────────────────────────────────
+
+    def _dietary_score(
+        self,
+        restaurant: RestaurantResult,
+        snapshot: UserProfileSnapshot,
+    ) -> int:
+        if not snapshot.dietary_flags:
+            return self.DIETARY_W  # no dietary needs → full marks
+
+        r_dietary = _norm_set(_r_dietary(restaurant))
+        matched   = len(r_dietary & snapshot.dietary_flags)
+        needed    = len(snapshot.dietary_flags)
+
+        if needed == 0:
+            return self.DIETARY_W
+
+        return round(self.DIETARY_W * matched / needed)
+
+    # ── Rating baseline ───────────────────────────────────────────────────────
+
+    def _rating_score(self, restaurant: RestaurantResult) -> int:
+        """
+        +10 rating ≥ 4.5
+        +7  rating ≥ 4.0
+        +4  rating ≥ 3.5
+         0  below 3.5 or unknown
+        """
+        r = restaurant.rating  # RestaurantResult uses .rating not .average_rating
+        if r is None:
+            return 0
+        if r >= 4.5:
+            return 10
+        if r >= 4.0:
+            return 7
+        if r >= 3.5:
+            return 4
+        return 0
+
+    # ── Hard-drop check ───────────────────────────────────────────────────────
+
+    def _is_aversion_hit(
+        self,
+        restaurant: RestaurantResult,
+        snapshot: UserProfileSnapshot,
+    ) -> bool:
+        """Return True if the restaurant's cuisine matches any stored aversion."""
+        if not snapshot.cuisine_aversions:
+            return False
+        r_cuisine = _r_cuisine(restaurant)
+        r_tokens  = set(r_cuisine.split())
+        for aversion in snapshot.cuisine_aversions:
+            if aversion == r_cuisine or aversion in r_cuisine:
+                return True
+            if r_tokens & set(aversion.split()):
+                return True
+        return False
+
+    # ── score_all (public) ────────────────────────────────────────────────────
+
+    def score_all(
+        self,
+        candidates: list[RestaurantResult],
+        snapshot: UserProfileSnapshot,
+        top_k: int = 15,
+    ) -> list[tuple[RestaurantResult, int]]:
+        """
+        Score all candidates and return the top *top_k* by descending score.
+
+        Restaurants that hit the hard-drop aversion rule are excluded entirely.
+
+        Args:
+            candidates: Up to ~50 restaurants from hybrid_search.
+            snapshot:   Derived from the user's stored profile.
+            top_k:      How many survivors to return (default 15).
+
+        Returns:
+            List of (RestaurantResult, score) tuples, highest score first.
+        """
+        scored: list[tuple[RestaurantResult, int]] = []
+
+        for r in candidates:
+            if self._is_aversion_hit(r, snapshot):
+                logger.debug(
+                    "Hard-drop restaurant %s (%s) — cuisine aversion hit",
+                    r.id, r.name,
+                )
                 continue
 
-        return 0, None
+            score = (
+                self._cuisine_score(r, snapshot)
+                + self._vibe_score(r, snapshot)
+                + self._price_score(r, snapshot)
+                + self._dietary_score(r, snapshot)
+                + self._rating_score(r)
+            )
+            scored.append((r, score))
 
-    def _score_dietary(
-        self,
-        restaurant: RestaurantResult,
-        user_profile: dict[str, Any],
-    ) -> tuple[int, list[FitTag]]:
-        """
-        +5 per matching dietary flag, capped at 15.
-        Returns (total_points, list[FitTag]).
-        """
-        user_dietary: list[str] = [
-            d.lower() for d in user_profile.get("dietary_flags", [])
-        ]
-        rest_dietary: list[str] = [
-            d.lower()
-            for d in (restaurant.meta.get("dietary_flags", []) if restaurant.meta else [])
-        ]
-
-        if not user_dietary or not rest_dietary:
-            return 0, []
-
-        matched = [d for d in user_dietary if d in rest_dietary]
-        if not matched:
-            return 0, []
-
-        pts = min(len(matched) * 5, 15)
-        tags = [
-            FitTag(label=f"{flag.title()}-friendly", type="dietary")
-            for flag in matched
-        ]
-        return pts, tags
-
-    def _score_allergy(
-        self,
-        restaurant: RestaurantResult,
-    ) -> tuple[int, FitTag | None]:
-        """
-        +10 if allergy_safe=True, +5 if only intolerance-level warnings, 0 if severe.
-        Expects restaurant already annotated by AllergyGuard.
-        Returns (points_awarded, FitTag | None).
-        """
-        if restaurant.allergy_safe and not restaurant.allergy_warnings:
-            tag = FitTag(label="Safe for your allergy profile", type="allergy_safe")
-            return 10, tag
-
-        if not restaurant.allergy_warnings:
-            return 10, FitTag(label="Safe for your allergy profile", type="allergy_safe")
-
-        severities = {w.severity for w in restaurant.allergy_warnings}
-        danger_levels = {"anaphylactic", "severe"}
-        if severities & danger_levels:
-            return 0, None
-
-        # Only intolerance / moderate warnings remain
-        return 5, None
+        scored.sort(key=lambda t: t[1], reverse=True)
+        return scored[:top_k]

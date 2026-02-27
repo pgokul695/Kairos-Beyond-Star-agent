@@ -18,6 +18,17 @@ class Settings(BaseSettings):
     embedding_model: str = Field("gemini-embedding-001", env="EMBEDDING_MODEL")
     embedding_dimensions: int = Field(768, env="EMBEDDING_DIMENSIONS")
 
+    # JWT
+    jwt_secret: str = Field(..., env="JWT_SECRET")
+    jwt_algorithm: str = Field("HS256", env="JWT_ALGORITHM")
+    access_token_expire_minutes: int = Field(30, env="ACCESS_TOKEN_EXPIRE_MINUTES")
+    refresh_token_expire_days: int = Field(7, env="REFRESH_TOKEN_EXPIRE_DAYS")
+
+    # ProtoPost (password reset email service)
+    protopost_base_url: str = Field("https://kairos-t0.gokulp.online", env="PROTOPOST_BASE_URL")
+    protopost_auth_token: str = Field("66029484eec5b5729bdb367428ceec71", env="PROTOPOST_AUTH_TOKEN")
+    protopost_from_email: str = Field("noreply@kairos.gokulp.online", env="PROTOPOST_FROM_EMAIL")
+
     # Security
     service_token: str = Field(..., env="SERVICE_TOKEN")
     allowed_origins: str = Field(
@@ -28,6 +39,10 @@ class Settings(BaseSettings):
     # App
     app_env: str = Field("development", env="APP_ENV")
     log_level: str = Field("INFO", env="LOG_LEVEL")
+
+    # Local GPU ML (optional — GTX 1650 4 GB VRAM)
+    use_local_embeddings: bool = Field(False, env="USE_LOCAL_EMBEDDINGS")
+    use_local_reranker: bool = Field(False, env="USE_LOCAL_RERANKER")
 
     # Derived
     @property
