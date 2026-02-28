@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     use_local_embeddings: bool = Field(False, env="USE_LOCAL_EMBEDDINGS")
     use_local_reranker: bool = Field(False, env="USE_LOCAL_RERANKER")
 
+    # Ollama embeddings (primary when use_ollama_embeddings=True)
+    ollama_base_url: str = Field("http://localhost:11434", env="OLLAMA_BASE_URL")
+    ollama_embed_model: str = Field("nomic-embed-text", env="OLLAMA_EMBED_MODEL")
+    use_ollama_embeddings: bool = Field(True, env="USE_OLLAMA_EMBEDDINGS")
+
     # Derived
     @property
     def allowed_origins_list(self) -> list[str]:

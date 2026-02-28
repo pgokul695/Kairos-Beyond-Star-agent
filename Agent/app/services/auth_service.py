@@ -2,7 +2,7 @@
 Auth service — registration, login, token management, and password reset.
 
 Invariants:
-  - Passwords are hashed with passlib bcrypt only — never stored plain.
+  - Passwords are SHA-256 pre-hashed then bcrypt-hashed — never stored plain.
   - Refresh tokens are stored as SHA-256 hashes only — never the raw token.
   - decode_token always validates the "type" claim — access ≠ refresh.
   - ProtoPost delivery errors are swallowed — never propagate to the client.
@@ -19,11 +19,12 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import bcrypt
 import httpx
 from fastapi import Depends, Header, HTTPException
 from jose import JWTError, jwt
-from passlib.context import CryptContext
-from sqlalchemy import insert, select
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -44,18 +45,23 @@ from app.schemas.auth import (
 logger = logging.getLogger(__name__)
 
 # ── Password hashing ──────────────────────────────────────────────────────────
+# SHA-256 pre-hash sidesteps bcrypt's hard 72-byte limit while keeping full
+# entropy.  digest() → 32 bytes, always well within bcrypt's safe range.
 
-_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def _pre_hash(plain: str) -> bytes:
+    """Return SHA-256 digest of *plain* as bytes (32 bytes)."""
+    return hashlib.sha256(plain.encode("utf-8")).digest()
 
 
 def hash_password(plain: str) -> str:
-    """Return a bcrypt hash of *plain*."""
-    return _pwd_context.hash(plain)
+    """Return a bcrypt hash of *plain* (SHA-256 pre-hashed)."""
+    return bcrypt.hashpw(_pre_hash(plain), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
     """Return True if *plain* matches *hashed*."""
-    return _pwd_context.verify(plain, hashed)
+    return bcrypt.checkpw(_pre_hash(plain), hashed.encode("utf-8"))
 
 
 # ── JWT helpers ───────────────────────────────────────────────────────────────

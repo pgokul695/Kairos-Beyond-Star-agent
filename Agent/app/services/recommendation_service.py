@@ -158,7 +158,7 @@ async def _fetch_review_snippets(
                     review_text,
                     ROW_NUMBER() OVER (
                         PARTITION BY restaurant_id
-                        ORDER BY helpful_count DESC NULLS LAST, created_at DESC
+                        ORDER BY review_rating DESC NULLS LAST, created_at DESC
                     ) AS rn
                 FROM reviews
                 WHERE restaurant_id = ANY(:ids)
@@ -534,7 +534,7 @@ async def get_expanded_detail(
             SELECT review_text FROM reviews
             WHERE restaurant_id = :rid
               AND review_text IS NOT NULL
-            ORDER BY helpful_count DESC NULLS LAST, created_at DESC
+            ORDER BY review_rating DESC NULLS LAST, created_at DESC
             LIMIT 10
         """),
         {"rid": restaurant_id},

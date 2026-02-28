@@ -6,7 +6,9 @@ One-to-one with users.uid.
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String
+from datetime import datetime, timezone
+
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.database import Base
@@ -33,7 +35,9 @@ class UserCredentials(Base):
     reset_otp = Column(String(6), nullable=True)
     reset_otp_expiry = Column(DateTime(timezone=True), nullable=True)
 
-    created_at = Column(DateTime(timezone=True), server_default="now()")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(
-        DateTime(timezone=True), server_default="now()", onupdate="now()"
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=lambda: datetime.now(timezone.utc),
     )
